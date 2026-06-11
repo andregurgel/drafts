@@ -27,6 +27,18 @@ function posSiglas(posicoes) {
   posicoes.forEach(p => { const s = POS_SIGLA[p]; if (s && out.indexOf(s) === -1) out.push(s); });
   return out.join(' · ');
 }
+// Bandeiras (emoji) por seleção
+const FLAGS = {
+  'México':'🇲🇽','Coreia do Sul':'🇰🇷','África do Sul':'🇿🇦','Tchéquia':'🇨🇿','Canadá':'🇨🇦','Bósnia':'🇧🇦',
+  'Estados Unidos':'🇺🇸','Paraguai':'🇵🇾','Austrália':'🇦🇺','Costa do Marfim':'🇨🇮','Equador':'🇪🇨','Holanda':'🇳🇱',
+  'Arábia Saudita':'🇸🇦','Uruguai':'🇺🇾','França':'🇫🇷','Senegal':'🇸🇳','Iraque':'🇮🇶','Noruega':'🇳🇴',
+  'Jordânia':'🇯🇴','Portugal':'🇵🇹','RD Congo':'🇨🇩','Brasil':'🇧🇷','Argentina':'🇦🇷','Inglaterra':'🏴󠁧󠁢󠁥󠁮󠁧󠁿',
+  'Espanha':'🇪🇸','Alemanha':'🇩🇪','Bélgica':'🇧🇪','Suíça':'🇨🇭','Croácia':'🇭🇷','Turquia':'🇹🇷','Áustria':'🇦🇹',
+  'Suécia':'🇸🇪','Colômbia':'🇨🇴','Japão':'🇯🇵','Irã':'🇮🇷','Uzbequistão':'🇺🇿','Catar':'🇶🇦','Gana':'🇬🇭',
+  'Cabo Verde':'🇨🇻','Curaçao':'🇨🇼','Haiti':'🇭🇹','Escócia':'🏴󠁧󠁢󠁳󠁣󠁴󠁿','Panamá':'🇵🇦','Nova Zelândia':'🇳🇿',
+  'Marrocos':'🇲🇦','Argélia':'🇩🇿','Egito':'🇪🇬','Tunísia':'🇹🇳',
+};
+function flag(selecao) { return FLAGS[selecao] || '🏳️'; }
 const TEAM_COLORS = ['#e63946','#1d7874','#f4a261','#5a189a','#2a9d8f','#0353a4'];
 const PICK_MODELS = {
   linear: { nome: 'Linear', desc: 'A mesma ordem se repete toda rodada.' },
@@ -43,6 +55,7 @@ function freshState() {
     numTeams: 4,
     restrictionMode: 'locked',  // modo único: formação no campo (posição é guia, não regra)
     maxSameNation: 0,           // 0 = sem limite; N = máx. jogadores da mesma seleção por time
+    timerSeconds: 0,            // 0 = sem timer; N = segundos por pick (auto-pick ao estourar)
     picksPerTeam: 11,           // sempre 11 (slots da formação)
     pickModel: 'snake',
     teams: [],                   // {id, participant, name, formation, slots:[], players:[]}
@@ -50,6 +63,8 @@ function freshState() {
     roundOrders: {},             // { round: [teamIds] }
     history: [],                 // {teamId, playerId, slotId}
     availableIds: [],
+    subPassed: [],               // ids de times que mantiveram (fase de ajustes)
+    subRotation: 0,              // contador de turnos da fase de ajustes
     selectedSlotId: null,
     filterPos: '',
     search: '',
@@ -98,6 +113,20 @@ function curRound() { return Math.floor(picksMade() / state.numTeams) + 1; }
 function curIndex() { return picksMade() % state.numTeams; }
 function currentTeamId() { return getRoundOrder(curRound())[curIndex()]; }
 function draftComplete() { return picksMade() >= state.numTeams * state.picksPerTeam; }
+// Próximos picks a partir do atual (não revela rodadas futuras no modo aleatório)
+function upcomingPicks(count) {
+  const out = [];
+  const total = state.numTeams * state.picksPerTeam;
+  const isRandom = state.pickModel === 'random';
+  let n = picksMade();
+  while (out.length < count && n < total) {
+    const round = Math.floor(n / state.numTeams) + 1;
+    if (isRandom && round > curRound()) break; // não decide rodadas aleatórias antes da hora
+    out.push({ pickNo: n + 1, round, teamId: getRoundOrder(round)[n % state.numTeams], current: n === picksMade() });
+    n++;
+  }
+  return out;
+}
 
 /* ---------------- Elegibilidade / formação (modo travado) ---------------- */
 function eligibleForRole(role) {
@@ -169,7 +198,7 @@ function doPick(playerId, slotId) {
   state.availableIds = state.availableIds.filter(id => id !== playerId);
   state.history.push({ teamId: team.id, playerId: playerId, slotId: slotId || null });
   state.selectedSlotId = null;
-  if (draftComplete()) state.phase = 'summary';
+  if (draftComplete()) enterPostDraft();
   save(); render();
 }
 
@@ -195,6 +224,50 @@ function novoDraft() {
   state = freshState();
   ensureTeams();
   render();
+}
+
+/* ---------------- Fase de ajustes (substituições) ---------------- */
+function offPositionSlots(team) {
+  return team.slots.filter(s => s.playerId && !window.eligByRole(s.role, PLAYERS_BY_ID[s.playerId]));
+}
+function enterPostDraft() {
+  state.subPassed = [];
+  state.subRotation = 0;
+  state.selectedSlotId = null;
+  const anyOff = state.teams.some(t => offPositionSlots(t).length > 0);
+  state.phase = anyOff ? 'subs' : 'summary';
+}
+function subActive() {
+  return state.teams.filter(t => offPositionSlots(t).length > 0 && state.subPassed.indexOf(t.id) === -1);
+}
+function currentSubTeam() {
+  const a = subActive();
+  return a.length ? a[state.subRotation % a.length] : null;
+}
+function doSubPick(playerId, slotId) {
+  const team = currentSubTeam();
+  if (!team || !state.availableIds.includes(playerId)) return;
+  if (nationBlocked(team, PLAYERS_BY_ID[playerId])) return;
+  const slot = team.slots.find(s => s.id === slotId);
+  if (!slot) return;
+  if (slot.playerId) state.availableIds.push(slot.playerId); // devolve o antigo ao pool
+  slot.playerId = playerId;
+  state.availableIds = state.availableIds.filter(id => id !== playerId);
+  state.selectedSlotId = null;
+  state.subRotation++; // passa a vez (alterna entre os times)
+  if (!subActive().length) state.phase = 'summary';
+  save(); render();
+}
+function subPass() {
+  const team = currentSubTeam();
+  if (team) state.subPassed.push(team.id); // mantém como está; sai da fase
+  state.selectedSlotId = null;
+  if (!subActive().length) state.phase = 'summary';
+  save(); render();
+}
+function activeTeamId() {
+  if (state.phase === 'subs') { const t = currentSubTeam(); return t ? t.id : -1; }
+  return currentTeamId();
 }
 
 /* ---------------- Cálculos de time ---------------- */
@@ -225,16 +298,54 @@ function render() {
   if (state.phase === 'setup') app.innerHTML = viewSetup();
   else if (state.phase === 'draw') app.innerHTML = viewDraw();
   else if (state.phase === 'draft') app.innerHTML = viewDraft();
+  else if (state.phase === 'subs') app.innerHTML = viewSubs();
   else if (state.phase === 'summary') app.innerHTML = viewSummary();
   // refoco no campo de busca, se existir
   const s = document.getElementById('searchInput');
-  if (s && state.phase === 'draft') { s.focus(); s.value = state.search; s.setSelectionRange(s.value.length, s.value.length); }
+  if (s && (state.phase === 'draft' || state.phase === 'subs')) { s.focus(); s.value = state.search; s.setSelectionRange(s.value.length, s.value.length); }
+  // timer do pick
+  if (state.phase === 'draft' && state.timerSeconds) ensurePickTimer(); else stopPickTimer();
+}
+
+/* ---------------- Timer por pick + auto-pick ---------------- */
+let _timerInterval = null, _timerDeadline = 0, _timerPick = -1;
+function stopPickTimer() { if (_timerInterval) { clearInterval(_timerInterval); _timerInterval = null; } }
+function ensurePickTimer() {
+  const pn = picksMade();
+  if (_timerInterval && _timerPick === pn) return; // já rodando para este pick
+  stopPickTimer();
+  _timerPick = pn;
+  _timerDeadline = Date.now() + state.timerSeconds * 1000;
+  _timerInterval = setInterval(() => {
+    if (state.rolePicker) { _timerDeadline += 250; return; } // pausa com dropdown aberto
+    const rem = Math.max(0, Math.ceil((_timerDeadline - Date.now()) / 1000));
+    const el = document.getElementById('pickTimer');
+    if (el) { el.textContent = rem + 's'; el.classList.toggle('low', rem <= 10); }
+    if (rem <= 0) { stopPickTimer(); autoPick(); }
+  }, 250);
+}
+function autoPick() {
+  if (state.phase !== 'draft') return;
+  const team = getTeam(currentTeamId());
+  const empty = team.slots.filter(s => !s.playerId);
+  if (!empty.length) return;
+  const avail = state.availableIds.map(id => PLAYERS_BY_ID[id])
+    .filter(p => !nationBlocked(team, p)).sort((a, b) => b.overall - a.overall);
+  if (!avail.length) return;
+  // melhor jogador elegível para alguma vaga vazia; senão, melhor disponível na 1ª vaga
+  let pick = null;
+  for (const slot of empty) {
+    const p = avail.find(x => window.eligByRole(slot.role, x));
+    if (p && (!pick || p.overall > pick.p.overall)) pick = { slot, p };
+  }
+  if (!pick) pick = { slot: empty[0], p: avail[0] };
+  doPick(pick.p.id, pick.slot.id);
 }
 
 function renderSteps() {
   const steps = [['setup', '1 · Configurar'], ['draw', '2 · Sorteio'], ['draft', '3 · Draft'], ['summary', '4 · Resumo']];
   const order = ['setup', 'draw', 'draft', 'summary'];
-  const curIdx = order.indexOf(state.phase);
+  const curIdx = state.phase === 'subs' ? 2 : order.indexOf(state.phase);
   document.getElementById('steps').innerHTML = steps.map(([k, label], i) => {
     const cls = i === curIdx ? 'step active' : (i < curIdx ? 'step done' : 'step');
     return `<span class="${cls}">${label}</span>`;
@@ -271,6 +382,13 @@ function viewSetup() {
         <select data-action="max-nation">
           <option value="0" ${state.maxSameNation === 0 ? 'selected' : ''}>Sem limite</option>
           ${[1,2,3,4,5].map(n => `<option value="${n}" ${state.maxSameNation === n ? 'selected' : ''}>${n} jogador${n > 1 ? 'es' : ''}</option>`).join('')}
+        </select>
+      </label>
+
+      <label class="field">Tempo por pick
+        <select data-action="timer">
+          <option value="0" ${state.timerSeconds === 0 ? 'selected' : ''}>Sem timer</option>
+          ${[30,45,60,90].map(n => `<option value="${n}" ${state.timerSeconds === n ? 'selected' : ''}>${n}s</option>`).join('')}
         </select>
       </label>
     </div>
@@ -335,13 +453,30 @@ function viewDraft() {
         Rodada <b>${curRound()}</b>/${state.picksPerTeam} · Pick <b>${picksMade() + 1}</b>/${total}
         <div class="bar"><span style="width:${(picksMade() / total) * 100}%"></span></div>
       </div>
+      ${state.timerSeconds ? `<span class="pick-timer" id="pickTimer">${state.timerSeconds}s</span>` : ''}
       <button class="btn ghost small" data-action="undo" ${picksMade() ? '' : 'disabled'}>↶ Desfazer</button>
     </div>`;
 
   const main = state.restrictionMode === 'locked' ? draftLocked(team) : draftFree();
   const aside = teamsAside();
 
-  return `<section class="draft-wrap">${header}<div class="draft-body">${main}${aside}</div></section>`;
+  return `<section class="draft-wrap">${header}${upcomingStrip()}<div class="draft-body">${main}${aside}</div></section>`;
+}
+
+function upcomingStrip() {
+  if (state.numTeams < 2) return '';
+  const list = upcomingPicks(8);
+  if (!list.length) return '';
+  let lastRound = list[0].round;
+  const chips = list.map((u, i) => {
+    const t = getTeam(u.teamId);
+    const nome = esc(t.participant || ('P' + u.teamId));
+    const sep = i > 0 ? (u.round !== lastRound ? '<span class="up-sep rnd">· R' + u.round + ' ·</span>' : '<span class="up-sep">›</span>') : '';
+    lastRound = u.round;
+    return `${sep}<span class="up-chip ${u.current ? 'now' : ''}" style="--c:${teamColor(u.teamId)}">${u.current ? '▶ ' : ''}${nome}</span>`;
+  }).join('');
+  const random = state.pickModel === 'random' ? '<span class="up-more">próximas rodadas sorteadas na hora</span>' : '';
+  return `<div class="upcoming"><span class="up-label">Próximos:</span>${chips}${random}</div>`;
 }
 
 function poolFilters(extra) {
@@ -367,7 +502,7 @@ function playerCard(p, opts) {
   const blocked = opts.blocked;
   const isDisabled = blocked || opts.disabled;
   const cls = (opts.tier === 'fallback' ? ' fallback' : '') + (blocked ? ' blocked' : '') + (isDisabled ? ' disabled' : '');
-  const act = isDisabled ? '' : `data-action="pick" data-player="${p.id}"`;
+  const act = isDisabled ? '' : `data-action="${opts.sub ? 'sub-pick' : 'pick'}" data-player="${p.id}"`;
   let tag = '';
   if (blocked) tag = '<span class="tag warn">seleção cheia</span>';
   else if (opts.offPos) tag = '<span class="tag offpos">! fora de posição</span>';
@@ -375,7 +510,7 @@ function playerCard(p, opts) {
     <button class="pcard${cls}${opts.offPos ? ' offpos' : ''}" ${act}>
       <span class="ovr">${p.overall}</span>
       <span class="pinfo">
-        <b>${esc(p.nome)}</b>
+        <b>${flag(p.selecao)} ${esc(p.nome)}</b>
         <small>${posSiglas(p.posicoes)} · ${esc(p.selecao)}</small>
         <small class="club">${esc(p.clube)}</small>
       </span>
@@ -432,7 +567,7 @@ function draftLocked(team) {
     const cls = `slot ${filled ? 'filled' : 'empty'} cat-${cat}${s.fixed ? ' fixed' : ' draggable'}${sel}${offPos ? ' offpos' : ''}`;
     const warn = offPos ? `<span class="slot-warn" title="Fora de posição">!</span>` : '';
     const inner = filled
-      ? `${warn}<span class="slot-ovr">${filled.overall}</span><span class="slot-name">${esc(shortName(filled.nome))}</span><span class="slot-role">${window.ROLES[s.role].label}</span>`
+      ? `${warn}<span class="slot-ovr">${filled.overall}</span><span class="slot-name">${flag(filled.selecao)} ${esc(shortName(filled.nome))}</span><span class="slot-role">${window.ROLES[s.role].label}</span>`
       : `<span class="slot-role big">${window.ROLES[s.role].label}</span>`;
     return `<button class="${cls}" data-slot="${s.id}" style="left:${s.x}%;top:${s.y}%">${inner}</button>`;
   }).join('');
@@ -513,17 +648,84 @@ function teamsAside() {
       <h3>Times</h3>
       ${state.teams.map(t => {
         const ids = teamPlayerIds(t);
-        const isCur = t.id === currentTeamId();
+        const isCur = t.id === activeTeamId();
         return `
         <div class="team-mini ${isCur ? 'current' : ''}" style="--c:${teamColor(t.id)}">
           <div class="tm-head"><b>${esc(t.participant || ('Participante ' + t.id))}</b><span>${ids.length}${state.restrictionMode === 'locked' ? '/11' : ''} · méd ${teamAvg(t) || '—'}</span></div>
           <div class="tm-players">${ids.map(id => {
             const p = PLAYERS_BY_ID[id];
-            return `<span class="chip">${p.overall} ${esc(shortName(p.nome))}</span>`;
+            return `<span class="chip">${p.overall} ${flag(p.selecao)} ${esc(shortName(p.nome))}</span>`;
           }).join('') || '<span class="muted">—</span>'}</div>
         </div>`;
       }).join('')}
     </aside>`;
+}
+
+/* ---------------- View: Ajustes (substituições) ---------------- */
+function viewSubs() {
+  const team = currentSubTeam();
+  if (!team) { state.phase = 'summary'; return viewSummary(); }
+  const offSlots = offPositionSlots(team);
+
+  const bands = `
+    <div class="zone z-atk"><span>ATAQUE</span></div>
+    <div class="zone z-mid"><span>MEIO</span></div>
+    <div class="zone z-def"><span>DEFESA</span></div>`;
+
+  const slotsHtml = team.slots.map(s => {
+    const filled = s.playerId ? PLAYERS_BY_ID[s.playerId] : null;
+    const cat = window.roleCategory(s.role);
+    const off = filled && !window.eligByRole(s.role, filled);
+    const sel = state.selectedSlotId === s.id ? ' selected' : '';
+    const cls = `slot ${filled ? 'filled' : 'empty'} cat-${cat}${off ? ' offpos' : ''}${sel}`;
+    const warn = off ? `<span class="slot-warn">!</span>` : '';
+    const act = off ? `data-action="sub-select" data-slot="${s.id}"` : '';
+    const inner = filled
+      ? `${warn}<span class="slot-ovr">${filled.overall}</span><span class="slot-name">${flag(filled.selecao)} ${esc(shortName(filled.nome))}</span><span class="slot-role">${window.ROLES[s.role].label}</span>`
+      : `<span class="slot-role big">${window.ROLES[s.role].label}</span>`;
+    return `<button class="${cls}" ${act} style="left:${s.x}%;top:${s.y}%">${inner}</button>`;
+  }).join('');
+
+  const pitch = `
+    <div class="pitch-wrap">
+      <div class="formation-head"><h3>${esc(team.participant || ('Participante ' + team.id))} <span class="formation-label">${formationLabel(team)}</span></h3></div>
+      <div class="pitch">${bands}${slotsHtml}</div>
+      <div class="pitch-meta">${offSlots.length} fora de posição — clique num <b style="color:#e63946">!</b> para substituir.</div>
+    </div>`;
+
+  let poolHtml;
+  if (!state.selectedSlotId) {
+    poolHtml = `<div class="pool"><div class="hint big">👈 Clique numa vaga com <b style="color:#e63946">!</b> para escolher um substituto na posição,<br><small>ou clique em <b>Manter assim</b> se estiver satisfeito com o time.</small></div></div>`;
+  } else {
+    const slot = team.slots.find(s => s.id === state.selectedSlotId);
+    const atual = PLAYERS_BY_ID[slot.playerId];
+    const role = window.ROLES[slot.role];
+    const pool = state.availableIds.map(id => PLAYERS_BY_ID[id]).filter(matchesFilter).sort((a, b) => {
+      const ba = nationBlocked(team, a), bb = nationBlocked(team, b);
+      if (ba !== bb) return ba ? 1 : -1;
+      const ea = window.eligByRole(slot.role, a), eb = window.eligByRole(slot.role, b);
+      if (ea !== eb) return ea ? -1 : 1;
+      return b.overall - a.overall;
+    });
+    poolHtml = `
+      <div class="pool">
+        ${poolFilters(`<button class="btn ghost small" data-action="sub-clear">✕ cancelar</button>`)}
+        <div class="pool-count">Substituir ${atual ? `<b>${flag(atual.selecao)} ${esc(shortName(atual.nome))}</b>` : ''} por <b>${role.nome}</b>${nationNote()}${pool.length > 150 ? ' · mostrando 150' : ''}</div>
+        <div class="pool-grid">${pool.slice(0, 150).map(p => playerCard(p, { blocked: nationBlocked(team, p), offPos: !window.eligByRole(slot.role, p), sub: true })).join('') || '<p class="muted">Nenhum jogador.</p>'}</div>
+      </div>`;
+  }
+
+  const header = `
+    <div class="draft-header">
+      <div class="turn" style="--c:${teamColor(team.id)}">
+        <span class="turn-label">Ajustes · vez de</span>
+        <b>${esc(team.participant || ('Participante ' + team.id))}</b>
+      </div>
+      <div class="progress">Times com jogador <b style="color:#e63946">!</b> fora de posição alternam pra substituir. ${subActive().length} time(s) restante(s).</div>
+      <button class="btn primary small" data-action="sub-pass">Manter assim ✓</button>
+    </div>`;
+
+  return `<section class="draft-wrap">${header}<div class="draft-body"><div class="locked-main">${pitch}${poolHtml}</div>${teamsAside()}</div></section>`;
 }
 
 /* ---------------- View: Summary ---------------- */
@@ -538,7 +740,7 @@ function viewSummary() {
         const p = s.playerId ? PLAYERS_BY_ID[s.playerId] : null;
         const off = p && !window.eligByRole(s.role, p);
         return `<tr><td class="pos-cell">${window.ROLES[s.role].label}</td>${p
-          ? `<td>${esc(p.nome)}${off ? ' <span class="sum-warn" title="Fora de posição">!</span>' : ''}</td><td class="ovr-cell">${p.overall}</td><td class="muted">${esc(p.clube)}</td><td>${esc(p.selecao)}</td>`
+          ? `<td>${flag(p.selecao)} ${esc(p.nome)}${off ? ' <span class="sum-warn" title="Fora de posição">!</span>' : ''}</td><td class="ovr-cell">${p.overall}</td><td class="muted">${esc(p.clube)}</td><td>${esc(p.selecao)}</td>`
           : `<td colspan="4" class="muted">—</td>`}</tr>`;
       }).join('');
     } else {
@@ -631,6 +833,10 @@ document.addEventListener('click', e => {
   else if (a === 'cancel-picker') cancelRolePicker();
   else if (a === 'clear-slot') { state.selectedSlotId = null; save(); render(); }
   else if (a === 'pick') doPick(el.getAttribute('data-player'), state.selectedSlotId);
+  else if (a === 'sub-select') { state.selectedSlotId = el.getAttribute('data-slot'); save(); render(); }
+  else if (a === 'sub-clear') { state.selectedSlotId = null; save(); render(); }
+  else if (a === 'sub-pick') doSubPick(el.getAttribute('data-player'), state.selectedSlotId);
+  else if (a === 'sub-pass') subPass();
   else if (a === 'undo') undo();
   else if (a === 'export-pdf') exportPDF();
   else if (a === 'novo' || a === 'reset-all') novoDraft();
@@ -642,6 +848,7 @@ document.addEventListener('change', e => {
   const a = el.getAttribute('data-action');
   if (a === 'num-teams') { state.numTeams = parseInt(el.value, 10); ensureTeams(); save(); render(); }
   else if (a === 'max-nation') { state.maxSameNation = parseInt(el.value, 10) || 0; save(); }
+  else if (a === 'timer') { state.timerSeconds = parseInt(el.value, 10) || 0; save(); }
   else if (a === 'set-formation') { if (el.value) applyFormation(getTeam(currentTeamId()), el.value); }
   else if (a === 'picks') { state.picksPerTeam = parseInt(el.value, 10) || 1; save(); }
   else if (a === 'filter-pos') { state.filterPos = el.value; save(); render(); }
