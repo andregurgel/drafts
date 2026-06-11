@@ -55,6 +55,7 @@ function freshState() {
     numTeams: 4,
     restrictionMode: 'locked',  // modo único: formação no campo (posição é guia, não regra)
     maxSameNation: 0,           // 0 = sem limite; N = máx. jogadores da mesma seleção por time
+    hideOverall: false,         // true = oculta overall durante picks/ajustes, revela só no resumo
     timerSeconds: 0,            // 0 = sem timer; N = segundos por pick (auto-pick ao estourar)
     picksPerTeam: 11,           // sempre 11 (slots da formação)
     pickModel: 'snake',
@@ -280,6 +281,20 @@ function teamAvg(team) {
   if (!ids.length) return 0;
   return Math.round(ids.reduce((s, id) => s + PLAYERS_BY_ID[id].overall, 0) / ids.length);
 }
+// Overall fica oculto durante picks/ajustes se a config pedir; sempre visível no resumo
+function ovrVisible() { return state.phase === 'summary' || !state.hideOverall; }
+function ovrText(n) { return ovrVisible() ? n : '?'; }
+function avgText(team) { return ovrVisible() ? (teamAvg(team) || '—') : '?'; }
+// Ordenação do pool: por overall normalmente; alfabética quando o overall está oculto (draft "às cegas")
+function poolSort(team, slotRole) {
+  const blind = state.hideOverall && state.phase !== 'summary';
+  return (a, b) => {
+    const ba = nationBlocked(team, a), bb = nationBlocked(team, b);
+    if (ba !== bb) return ba ? 1 : -1;
+    if (slotRole) { const ea = window.eligByRole(slotRole, a), eb = window.eligByRole(slotRole, b); if (ea !== eb) return ea ? -1 : 1; }
+    return blind ? a.nome.localeCompare(b.nome) : b.overall - a.overall;
+  };
+}
 function nationCount(team, selecao) {
   return teamPlayerIds(team).filter(id => PLAYERS_BY_ID[id].selecao === selecao).length;
 }
@@ -389,6 +404,13 @@ function viewSetup() {
         <select data-action="timer">
           <option value="0" ${state.timerSeconds === 0 ? 'selected' : ''}>Sem timer</option>
           ${[30,45,60,90].map(n => `<option value="${n}" ${state.timerSeconds === n ? 'selected' : ''}>${n}s</option>`).join('')}
+        </select>
+      </label>
+
+      <label class="field">Overall dos jogadores
+        <select data-action="hide-ovr">
+          <option value="0" ${!state.hideOverall ? 'selected' : ''}>Visível</option>
+          <option value="1" ${state.hideOverall ? 'selected' : ''}>Oculto até o resumo</option>
         </select>
       </label>
     </div>
@@ -508,7 +530,7 @@ function playerCard(p, opts) {
   else if (opts.offPos) tag = '<span class="tag offpos">! fora de posição</span>';
   return `
     <button class="pcard${cls}${opts.offPos ? ' offpos' : ''}" ${act}>
-      <span class="ovr">${p.overall}</span>
+      <span class="ovr${ovrVisible() ? '' : ' ovr-hidden'}">${ovrText(p.overall)}</span>
       <span class="pinfo">
         <b>${flag(p.selecao)} ${esc(p.nome)}</b>
         <small>${posSiglas(p.posicoes)} · ${esc(p.selecao)}</small>
@@ -567,7 +589,7 @@ function draftLocked(team) {
     const cls = `slot ${filled ? 'filled' : 'empty'} cat-${cat}${s.fixed ? ' fixed' : ' draggable'}${sel}${offPos ? ' offpos' : ''}`;
     const warn = offPos ? `<span class="slot-warn" title="Fora de posição">!</span>` : '';
     const inner = filled
-      ? `${warn}<span class="slot-ovr">${filled.overall}</span><span class="slot-name">${flag(filled.selecao)} ${esc(shortName(filled.nome))}</span><span class="slot-role">${window.ROLES[s.role].label}</span>`
+      ? `${warn}<span class="slot-ovr">${ovrText(filled.overall)}</span><span class="slot-name">${flag(filled.selecao)} ${esc(shortName(filled.nome))}</span><span class="slot-role">${window.ROLES[s.role].label}</span>`
       : `<span class="slot-role big">${window.ROLES[s.role].label}</span>`;
     return `<button class="${cls}" data-slot="${s.id}" style="left:${s.x}%;top:${s.y}%">${inner}</button>`;
   }).join('');
@@ -612,7 +634,7 @@ function draftLocked(team) {
         ${flashHtml}
         ${pickerHtml}
       </div>
-      <div class="pitch-meta">Preenchidos ${filledCount}/11 · média ${teamAvg(team) || '—'} · <span class="muted">arraste as bolas para remontar</span></div>
+      <div class="pitch-meta">Preenchidos ${filledCount}/11 · média ${avgText(team)} · <span class="muted">arraste as bolas para remontar</span></div>
     </div>`;
 
   let poolHtml;
@@ -623,13 +645,7 @@ function draftLocked(team) {
     if (!slot || slot.playerId) { state.selectedSlotId = null; return draftLocked(team); }
     const role = window.ROLES[slot.role];
     // mostra TODOS os disponíveis (elegíveis ao papel primeiro); qualquer um pode ser escalado
-    const pool = state.availableIds.map(id => PLAYERS_BY_ID[id]).filter(matchesFilter).sort((a, b) => {
-      const ba = nationBlocked(team, a), bb = nationBlocked(team, b);
-      if (ba !== bb) return ba ? 1 : -1;
-      const ea = window.eligByRole(slot.role, a), eb = window.eligByRole(slot.role, b);
-      if (ea !== eb) return ea ? -1 : 1;
-      return b.overall - a.overall;
-    });
+    const pool = state.availableIds.map(id => PLAYERS_BY_ID[id]).filter(matchesFilter).sort(poolSort(team, slot.role));
     const nElig = pool.filter(p => window.eligByRole(slot.role, p)).length;
     poolHtml = `
       <div class="pool">
@@ -651,10 +667,10 @@ function teamsAside() {
         const isCur = t.id === activeTeamId();
         return `
         <div class="team-mini ${isCur ? 'current' : ''}" style="--c:${teamColor(t.id)}">
-          <div class="tm-head"><b>${esc(t.participant || ('Participante ' + t.id))}</b><span>${ids.length}${state.restrictionMode === 'locked' ? '/11' : ''} · méd ${teamAvg(t) || '—'}</span></div>
+          <div class="tm-head"><b>${esc(t.participant || ('Participante ' + t.id))}</b><span>${ids.length}${state.restrictionMode === 'locked' ? '/11' : ''} · méd ${avgText(t)}</span></div>
           <div class="tm-players">${ids.map(id => {
             const p = PLAYERS_BY_ID[id];
-            return `<span class="chip">${p.overall} ${flag(p.selecao)} ${esc(shortName(p.nome))}</span>`;
+            return `<span class="chip">${ovrText(p.overall)} ${flag(p.selecao)} ${esc(shortName(p.nome))}</span>`;
           }).join('') || '<span class="muted">—</span>'}</div>
         </div>`;
       }).join('')}
@@ -681,7 +697,7 @@ function viewSubs() {
     const warn = off ? `<span class="slot-warn">!</span>` : '';
     const act = off ? `data-action="sub-select" data-slot="${s.id}"` : '';
     const inner = filled
-      ? `${warn}<span class="slot-ovr">${filled.overall}</span><span class="slot-name">${flag(filled.selecao)} ${esc(shortName(filled.nome))}</span><span class="slot-role">${window.ROLES[s.role].label}</span>`
+      ? `${warn}<span class="slot-ovr">${ovrText(filled.overall)}</span><span class="slot-name">${flag(filled.selecao)} ${esc(shortName(filled.nome))}</span><span class="slot-role">${window.ROLES[s.role].label}</span>`
       : `<span class="slot-role big">${window.ROLES[s.role].label}</span>`;
     return `<button class="${cls}" ${act} style="left:${s.x}%;top:${s.y}%">${inner}</button>`;
   }).join('');
@@ -700,13 +716,7 @@ function viewSubs() {
     const slot = team.slots.find(s => s.id === state.selectedSlotId);
     const atual = PLAYERS_BY_ID[slot.playerId];
     const role = window.ROLES[slot.role];
-    const pool = state.availableIds.map(id => PLAYERS_BY_ID[id]).filter(matchesFilter).sort((a, b) => {
-      const ba = nationBlocked(team, a), bb = nationBlocked(team, b);
-      if (ba !== bb) return ba ? 1 : -1;
-      const ea = window.eligByRole(slot.role, a), eb = window.eligByRole(slot.role, b);
-      if (ea !== eb) return ea ? -1 : 1;
-      return b.overall - a.overall;
-    });
+    const pool = state.availableIds.map(id => PLAYERS_BY_ID[id]).filter(matchesFilter).sort(poolSort(team, slot.role));
     poolHtml = `
       <div class="pool">
         ${poolFilters(`<button class="btn ghost small" data-action="sub-clear">✕ cancelar</button>`)}
@@ -849,6 +859,7 @@ document.addEventListener('change', e => {
   if (a === 'num-teams') { state.numTeams = parseInt(el.value, 10); ensureTeams(); save(); render(); }
   else if (a === 'max-nation') { state.maxSameNation = parseInt(el.value, 10) || 0; save(); }
   else if (a === 'timer') { state.timerSeconds = parseInt(el.value, 10) || 0; save(); }
+  else if (a === 'hide-ovr') { state.hideOverall = el.value === '1'; save(); render(); }
   else if (a === 'set-formation') { if (el.value) applyFormation(getTeam(currentTeamId()), el.value); }
   else if (a === 'picks') { state.picksPerTeam = parseInt(el.value, 10) || 1; save(); }
   else if (a === 'filter-pos') { state.filterPos = el.value; save(); render(); }
